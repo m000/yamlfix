@@ -1,5 +1,5 @@
 """Define adapter / helper classes to hide unrelated functionality in."""
-
+import base64
 import logging
 import re
 from functools import partial
@@ -14,6 +14,83 @@ from ruyaml.tokens import CommentToken
 from yamlfix.model import YamlfixConfig, YamlNodeStyle
 
 log = logging.getLogger(__name__)
+
+
+class DoubleBraceEncoder:
+    """Wrapper for encoding/decoding doublebrace blocks, commonly used for
+    template processing. The doublebrace blocks need to be hidden from ruyaml
+    and then restored.
+    """
+    # Customized base64 encoding/decoding. Allows simplified regex: r'[\w+]+={0,2}
+    b64enc = partial(base64.b64encode, altchars=b'_+')
+    b64dec = partial(base64.b64decode, altchars=b'_+')
+
+    # Marker character to use to identify encoded blocks, so they can be decoded.
+    marker = "★"
+
+    # Basic regular expressions.
+    doublebrace_re = r"(?P<block>{{(?:[^{}]|}(?!})|{(?!{))*}})"
+    lineindent_re = r"^(?P<indent>\s*)"
+    linetrailer_re = r"(?P<trailer>\s*(#.*)?)$"
+    enc_key_re = rf"(?P<enc_key>{marker}\d+{marker})"
+    enc_block_re = rf"{marker}(?P<enc_block>[\w+]+={{0,2}}){marker}"
+
+    def __init__(self):
+        self._solomap = {}
+
+    def encode(self, line: str) -> str:
+        # Check if the line is a "solo" doublebrace line.
+        # I.e. if the line contains a single doublebrace block, and perhaps a
+        # trailing comment. Such lines lines are encoded as mappings at the same
+        # indentation level, to prevent ruyaml from choking on them.
+        solo_line_re = self.lineindent_re + self.doublebrace_re + self.linetrailer_re
+        match_solo_line = re.match(solo_line_re, line)
+        if match_solo_line:
+            orig_value = (
+                f"{match_solo_line.group('block')}"
+                f"{match_solo_line.group('trailer')}"
+            )
+            enc_key = f"{self.marker}{len(self._solomap):04d}{self.marker}"
+            enc_value = (
+                f"{self.marker}"
+                f"{self.b64enc(orig_value.encode('utf-8')).decode()}"
+                f"{self.marker}"
+            )
+            self._solomap[enc_key] = enc_value
+            return (
+                f"{match_solo_line.group('indent')}"
+                f'"{enc_key}": '
+                f'"{enc_value}"'
+            )
+
+        # If this is not a solo line, encode brace blocks in-place.
+        # XXX: Not clear whether any surrounding quotes should be included in
+        #      the encoded values.
+        rpl = lambda m: "{marker}{enc_block}{marker}".format(
+            marker=self.marker,
+            enc_block=self.b64enc(m.group("block").encode("utf-8")).decode(),
+        )
+        return re.sub(self.doublebrace_re, rpl, line)
+
+    def decode(self, line: str) -> str:
+        # First decode "solo" doublebrace lines.
+        enc_solo_line_re = (
+            rf"{self.lineindent_re}"
+            rf"['\"]?{self.enc_key_re}['\"]?\s*:\s*"
+            rf"['\"]?{self.enc_block_re}['\"]?$"
+        )
+        match_enc_solo_line = re.match(enc_solo_line_re, line)
+        if match_enc_solo_line:
+            enc_key = match_enc_solo_line.group('enc_key')
+            encoded_block = self._solomap[enc_key]
+            decoded_block = self.b64dec(encoded_block.encode('utf-8')).decode()
+            return f"{match_enc_solo_line.group('indent')}{decoded_block}"
+
+        # Decode inline doublebrace blocks.
+        # Eliminate any quotes surrounding the block.
+        qenc_block_re = rf"(['\"]?{self.enc_block_re}['\"]?)"
+        rpl = lambda m: self.b64dec(m.group("enc_block").encode("utf-8")).decode()
+        return re.sub(qenc_block_re, rpl, line)
 
 
 class Yaml:
@@ -333,6 +410,7 @@ class SourceCodeFixer:
         """
         self.yaml = yaml.yaml
         self.config = config or YamlfixConfig()
+        self.doublebraces = DoubleBraceEncoder()
 
     def fix(self, source_code: str) -> str:
         """Run all yaml source code fixers.
@@ -346,17 +424,17 @@ class SourceCodeFixer:
         log.debug("Running source code fixers...")
 
         fixers = [
+            self._encode_doublebrace_blocks,
             self._fix_truthy_strings,
-            self._fix_jinja_variables,
             self._ruamel_yaml_fixer,
             self._restore_truthy_strings,
-            self._restore_jinja_variables,
             self._restore_double_exclamations,
             self._fix_comments,
             self._fix_flow_style_lists,
             self._fix_whitelines,
             self._fix_top_level_lists,
             self._add_newline_at_end_of_file,
+            self._restore_doublebrace_blocks,
         ]
 
         for fixer in fixers:
@@ -728,11 +806,8 @@ class SourceCodeFixer:
         """
         return source_code.rstrip() + "\n"
 
-    @staticmethod
-    def _fix_jinja_variables(source_code: str) -> str:
-        """Remove spaces between jinja variables.
-
-        So that they are not split in many lines by ruyaml
+    def _encode_doublebrace_blocks(self, source_code: str) -> str:
+        """Escapes double-brace blocks to "hide" them from ruyaml.
 
         Args:
             source_code: Source code to be corrected.
@@ -740,58 +815,25 @@ class SourceCodeFixer:
         Returns:
             Corrected source code.
         """
-        log.debug("Fixing jinja2 variables...")
+        log.debug("Fixing doublebrace blocks...")
         source_lines = source_code.splitlines()
         fixed_source_lines: List[str] = []
 
         for line in source_lines:
-            line_contains_jinja2_variable = re.search(r"{{.*}}", line)
-
-            if line_contains_jinja2_variable:
-                line = SourceCodeFixer._encode_jinja2_line(line)
-
+            line = self.doublebraces.encode(line)
             fixed_source_lines.append(line)
 
         return "\n".join(fixed_source_lines)
 
-    @staticmethod
-    def _encode_jinja2_line(line: str) -> str:
-        """Encode jinja variables so that they are not split.
-
-        Using a special character to join the elements inside the {{ }}, so that
-        they are all taken as the same word, and ruyamel doesn't split them.
+    def _restore_doublebrace_blocks(self, source_code: str) -> str:
+        """Restore double-brace blocks to their original state after ruyaml has
+        finished its processing.
         """
-        new_line = []
-        variable_terms: List[str] = []
-
-        for word in line.split(" "):
-            if re.search("}}", word):
-                variable_terms.append(word)
-                new_line.append("★".join(variable_terms))
-                variable_terms = []
-            elif re.search("{{", word) or len(variable_terms) > 0:
-                variable_terms.append(word)
-            else:
-                new_line.append(word)
-
-        return " ".join(new_line)
-
-    @staticmethod
-    def _restore_jinja_variables(source_code: str) -> str:
-        """Restore the jinja2 variables to their original state.
-
-        Remove the encoding introduced by _fix_jinja_variables to prevent ruyaml
-        to split the variables.
-        """
-        log.debug("Restoring jinja2 variables...")
+        log.debug("Restoring doublebrace blocks...")
         fixed_source_lines = []
 
         for line in source_code.splitlines():
-            line_contains_jinja2_variable = re.search(r"{{.*}}", line)
-
-            if line_contains_jinja2_variable:
-                line = line.replace("★", " ")
-
+            line = self.doublebraces.decode(line)
             fixed_source_lines.append(line)
 
         return "\n".join(fixed_source_lines)
