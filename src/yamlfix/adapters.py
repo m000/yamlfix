@@ -4,6 +4,7 @@ import logging
 import re
 from functools import partial
 from io import StringIO
+from pathlib import Path
 from typing import Any, Callable, List, Match, Optional, Tuple
 
 from ruyaml.main import YAML
@@ -823,6 +824,7 @@ class SourceCodeFixer:
             line = self.doublebraces.encode(line)
             fixed_source_lines.append(line)
 
+        (Path.home() / 'xxx.txt').write_text("\n".join(fixed_source_lines))
         return "\n".join(fixed_source_lines)
 
     def _restore_doublebrace_blocks(self, source_code: str) -> str:
@@ -832,8 +834,11 @@ class SourceCodeFixer:
         log.debug("Restoring doublebrace blocks...")
         fixed_source_lines = []
 
+        (Path.home() / 'yyy.0.txt').write_text(source_code)
+
         for line in source_code.splitlines():
             line = self.doublebraces.decode(line)
             fixed_source_lines.append(line)
 
+        (Path.home() / 'yyy.1.txt').write_text("\n".join(fixed_source_lines))
         return "\n".join(fixed_source_lines)
